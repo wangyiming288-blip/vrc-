@@ -1,27 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-KugouOSC —— 把酷狗音乐正在播放的「歌名 / 歌手 / 进度 / 歌词」
-           实时推送到 VRChat 聊天框（Chatbox）
-
-依赖：
-    pip install python-osc requests winsdk
-若 winsdk 装不上（新版 Python），改用：
-    pip install python-osc requests winrt-runtime winrt-Windows.Media.Control
-                winrt-Windows.Foundation winrt-Windows.Foundation.Collections
-
-用法：
-    1. 打开酷狗音乐并播放歌曲（建议先把歌拖回开头）
-    2. 双击 run.bat（或命令行执行 python kugou_osc.py）
-    3. 进入 VRChat，头顶聊天框即可看到
+KugouOSC —— 酷狗音乐 → VRChat 聊天框
+           歌名 / 歌手 / 进度 / 原文歌词 / 中文翻译 / CPU·GPU 名称与占用
+           硬件信息每 20 秒出现一次，显示数秒后自动隐去
 """
 
 import asyncio
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 
-# 防止控制台编码报错
 try:
     sys.stdout.reconfigure(errors="replace")
 except Exception:
@@ -36,38 +26,51 @@ try:
     from pythonosc.udp_client import SimpleUDPClient
 except ImportError as e:
     print(f"缺少依赖：{e}")
-    print("请先双击 install.bat 安装依赖，或执行：")
-    print("    pip install python-osc requests winsdk")
+    print("    pip install python-osc requests psutil")
     sys.exit(1)
+
+try:
+    import psutil
+    PSUTIL_OK = True
+except ImportError:
+    PSUTIL_OK = False
+    print("[!] 没装 psutil，硬件信息将不可用。安装：pip install psutil")
 
 
 # ============================ 用户配置 ============================
-VRC_IP   = "127.0.0.1"      # VRChat 在同一台电脑就保持默认
-VRC_PORT = 9000             # VRChat OSC 默认接收端口
+VRC_IP   = "127.0.0.1"
+VRC_PORT = 9000
 
-MULTILINE        = True     # True：歌名 / 进度 / 歌词 分三行
-SHOW_PROGRESS    = True     # 显示进度条
-SHOW_LYRIC       = True     # 显示歌词
-SHOW_WHEN_PAUSED = True     # 暂停时是否继续显示
+MULTILINE        = True
+SHOW_PROGRESS    = True
+SHOW_LYRIC       = True
+SHOW_TRANSLATION = True
+SHOW_HW          = True     # 是否显示硬件信息
+SHOW_HW_NAME     = True     # 硬件行是否带 CPU / GPU 型号名
+SHOW_WHEN_PAUSED = True
 
-CHATBOX_MIN_INTERVAL = 1.5  # 两次推送最短间隔（秒）。VRChat 有限流，别小于 1.5
-CHATBOX_MAX_LEN      = 142  # 聊天框字符上限（VRChat 上限 144，留点余量）
+CHATBOX_MIN_INTERVAL = 1.5
+CHATBOX_MAX_LEN      = 142
 
-BAR_WIDTH = 12              # 进度条宽度
-BAR_FULL  = "="             # 已完成部分
-BAR_EMPTY = "-"             # 未完成部分
-BAR_HEAD  = ">"             # 当前位置箭头，不想用就改成 ""
+HW_REFRESH = 5.0            # 硬件占用数值刷新间隔(秒)
 
-LYRIC_ORDER     = ("netease", "lrclib")   # 歌词源优先级
-FALLBACK_TO_ANY = True      # 找不到酷狗会话时，是否退而显示其它播放器
+# ── 硬件信息出现节奏 ──
+HW_ROTATE       = True      # True：每轮才出现；False：一直显示
+HW_SHOW_SECONDS = 3.0       # 每次显示多少秒
+HW_GAP_SECONDS  = 17.0      # 间隔多少秒 → 与上面相加 = 20 秒一轮
 
-# 歌词时间偏移（秒）。歌词显示比实际早，就调大；晚，就调小。
-# 例：显示太快 1.5 秒 → 改成 1.5；显示太慢 → 改成 -1.5
-LYRIC_OFFSET = 0.0
+BAR_WIDTH = 12
+BAR_FULL  = "="
+BAR_EMPTY = "-"
+BAR_HEAD  = ">"
 
-SEND_AVATAR_PARAMS = False  # 想在 Avatar 上用进度条就改 True
-PARAM_PROGRESS = "/avatar/parameters/KugouProgress"  # Float 0~1
-PARAM_PLAYING  = "/avatar/parameters/KugouPlaying"   # Bool
+LYRIC_ORDER     = ("netease", "lrclib")
+FALLBACK_TO_ANY = True
+LYRIC_OFFSET    = 0.0
+
+SEND_AVATAR_PARAMS = False
+PARAM_PROGRESS = "/avatar/parameters/KugouProgress"
+PARAM_PLAYING  = "/avatar/parameters/KugouPlaying"
 # ==================================================================
 
 
@@ -95,40 +98,50 @@ except ImportError:
 
 
 # ============================ 歌词模块 ============================
-class Lyrics:
-    """解析并查询 LRC 歌词"""
+def parse_lrc(lrc_text):
+    out = []
+    for raw in (lrc_text or "").splitlines():
+        stamps = re.findall(r"\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]", raw)
+        if not stamps:
+            continue
+        text = re.sub(r"\[\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?\]", "", raw).strip()
+        if not text:
+            continue
+        for mm, ss in stamps:
+            try:
+                sec = int(mm) * 60 + float(ss.replace(":", "."))
+            except ValueError:
+                continue
+            out.append((sec, text))
+    out.sort(key=lambda x: x[0])
+    return out
 
+
+class Track:
     def __init__(self):
-        self.lines = []          # [(秒, 文本), ...]
-
-    def load(self, lrc_text):
-        out = []
-        for raw in lrc_text.splitlines():
-            stamps = re.findall(r"\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]", raw)
-            if not stamps:
-                continue
-            text = re.sub(r"\[\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?\]", "", raw).strip()
-            if not text:
-                continue
-            for mm, ss in stamps:
-                try:
-                    sec = int(mm) * 60 + float(ss.replace(":", "."))
-                except ValueError:
-                    continue
-                out.append((sec, text))
-        out.sort(key=lambda x: x[0])
-        self.lines = out
+        self.lines = []
+        self.trans = []
 
     def at(self, t):
-        if not self.lines:
+        return self._pick(self.lines, t)
+
+    def trans_at(self, t):
+        return self._pick(self.trans, t)
+
+    @staticmethod
+    def _pick(lines, t):
+        if not lines:
             return ""
         cur = ""
-        for ts, txt in self.lines:
+        for ts, txt in lines:
             if ts <= t + 0.3:
                 cur = txt
             else:
                 break
         return cur
+
+    def has_trans(self):
+        return bool(self.trans)
 
 
 _SESSION = requests.Session()
@@ -144,7 +157,6 @@ def _norm(s):
 
 
 def _lyric_netease(title, artist):
-    """网易云音乐歌词源（中文歌命中率高）"""
     r = _SESSION.get(
         "https://music.163.com/api/search/get/web",
         params={"s": f"{title} {artist}".strip(), "type": 1, "limit": 10, "offset": 0},
@@ -175,16 +187,22 @@ def _lyric_netease(title, artist):
 
     r2 = _SESSION.get(
         "https://music.163.com/api/song/lyric",
-        params={"id": best["id"], "lv": 1, "kv": 1, "tv": -1},
+        params={"id": best["id"], "lv": 1, "kv": 1, "tv": 1},
         headers={"Referer": "https://music.163.com/"},
         timeout=6,
     )
-    lrc = (r2.json().get("lrc") or {}).get("lyric") or ""
-    return lrc if re.search(r"\[\d{1,3}:\d{1,2}", lrc) else None
+    data = r2.json()
+    lrc = (data.get("lrc") or {}).get("lyric") or ""
+    tly = (data.get("tlyric") or {}).get("lyric") or ""
+
+    if not re.search(r"\[\d{1,3}:\d{1,2}", lrc):
+        return None
+    if tly and not re.search(r"\[\d{1,3}:\d{1,2}", tly):
+        tly = ""
+    return (lrc, tly)
 
 
 def _lyric_lrclib(title, artist, album="", duration=0.0):
-    """lrclib.net 歌词源（英文歌 / 冷门歌命中率高）"""
     try:
         params = {"track_name": title}
         if artist:
@@ -197,7 +215,7 @@ def _lyric_lrclib(title, artist, album="", duration=0.0):
         if r.status_code == 200:
             synced = r.json().get("syncedLyrics")
             if synced:
-                return synced
+                return (synced, "")
     except Exception:
         pass
 
@@ -207,7 +225,7 @@ def _lyric_lrclib(title, artist, album="", duration=0.0):
         if r.status_code == 200:
             for item in r.json():
                 if item.get("syncedLyrics"):
-                    return item["syncedLyrics"]
+                    return (item["syncedLyrics"], "")
     except Exception:
         pass
     return None
@@ -220,22 +238,146 @@ def fetch_lrc(title, artist, album="", duration=0.0):
     if len(_lrc_cache) > 200:
         _lrc_cache.clear()
 
-    lrc = None
+    result = None
     for src in LYRIC_ORDER:
         try:
             if src == "netease":
-                lrc = _lyric_netease(title, artist)
+                result = _lyric_netease(title, artist)
             elif src == "lrclib":
-                lrc = _lyric_lrclib(title, artist, album, duration)
+                result = _lyric_lrclib(title, artist, album, duration)
         except Exception as e:
             print(f"    [歌词源 {src}] 出错：{e}")
-            lrc = None
-        if lrc:
+            result = None
+        if result:
             print(f"    [歌词] 命中源：{src}")
             break
 
-    _lrc_cache[key] = lrc
-    return lrc
+    _lrc_cache[key] = result
+    return result
+
+
+# ========================= 硬件监控 =========================
+_CPU_NAME = ""
+_GPU_NAME = ""
+
+
+def _get_cpu_name():
+    try:
+        import winreg
+        k = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+        )
+        name, _ = winreg.QueryValueEx(k, "ProcessorNameString")
+        winreg.CloseKey(k)
+        name = re.sub(r"\s+", " ", name).strip()
+        if name:
+            name = name.replace("(R)", "").replace("(TM)", "")
+            name = re.sub(r"\s+", " ", name).strip()
+            return name
+    except Exception as e:
+        print(f"    [CPU名] 注册表失败：{e}")
+
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Processor).Name"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=0x08000000,
+        )
+        if out.returncode == 0:
+            lines = [l.strip() for l in out.stdout.strip().splitlines() if l.strip()]
+            if lines:
+                return lines[0]
+    except Exception as e:
+        print(f"    [CPU名] WMI 失败：{e}")
+
+    try:
+        import platform
+        n = platform.processor()
+        if n:
+            return n
+    except Exception:
+        pass
+    return ""
+
+
+def _get_gpu_name():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=3,
+            creationflags=0x08000000,
+        )
+        if out.returncode == 0:
+            names = [v.strip() for v in out.stdout.strip().splitlines() if v.strip()]
+            if names:
+                return names[0].replace("NVIDIA ", "").replace("GeForce ", "")
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_VideoController).Name"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000,
+        )
+        if out.returncode == 0:
+            names = [v.strip() for v in out.stdout.strip().splitlines() if v.strip()]
+            names = [n for n in names if "Microsoft" not in n] or names
+            if names:
+                return names[0]
+    except Exception as e:
+        print(f"    [GPU名] WMI 失败：{e}")
+    return ""
+
+
+def _read_gpu_usage():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+            creationflags=0x08000000,
+        )
+        if out.returncode == 0:
+            vals = [v.strip() for v in out.stdout.strip().splitlines() if v.strip()]
+            if vals:
+                return max(int(float(v)) for v in vals)
+    except Exception:
+        pass
+    return None
+
+
+def get_hw_text(with_name=True):
+    parts = []
+
+    def named(base, name):
+        if with_name and name:
+            return f"{base} {name}"
+        return base
+
+    if PSUTIL_OK:
+        try:
+            u = psutil.cpu_percent(interval=None)
+            parts.append(named(f"CPU {u:.0f}%", _CPU_NAME))
+        except Exception:
+            pass
+        try:
+            parts.append(f"MEM {psutil.virtual_memory().percent:.0f}%")
+        except Exception:
+            pass
+
+    gpu = _read_gpu_usage()
+    if gpu is not None:
+        parts.append(named(f"GPU {gpu}%", _GPU_NAME))
+    elif _GPU_NAME:
+        parts.append(named("GPU", _GPU_NAME))
+
+    return "  ".join(parts)
+# ============================================================
 
 
 # ============================ 工具函数 ============================
@@ -255,7 +397,6 @@ def make_bar(pos, length, width=BAR_WIDTH):
 
 
 def timeline_position(tl, playing):
-    """SMTC 的 position 是「上次更新那一刻」的值，播放中需要补上流逝时间"""
     pos = tl.position.total_seconds()
     if playing and tl.last_updated_time is not None:
         try:
@@ -271,7 +412,6 @@ def timeline_position(tl, playing):
 
 
 def pick_session(manager):
-    """优先挑酷狗的会话"""
     try:
         sessions = list(manager.get_sessions())
     except Exception:
@@ -290,25 +430,56 @@ def pick_session(manager):
     return None
 
 
+def truncate(s, limit):
+    if limit <= 0:
+        return ""
+    if len(s) <= limit:
+        return s
+    if limit <= 1:
+        return "…"
+    return s[:limit - 1] + "…"
+
+
 # ============================ 主循环 ============================
 async def main():
+    global _CPU_NAME, _GPU_NAME
+
     client = SimpleUDPClient(VRC_IP, VRC_PORT)
     manager = await MediaManager.request_async()
 
-    lyrics = Lyrics()
+    track      = Track()
     lyric_key  = None
     last_title = None
     last_lyric = None
     last_text  = ""
     last_send  = 0.0
 
-    # ── 内部计时兜底（酷狗不给进度时用）──
-    fallback_key   = None          # 当前计时对应的歌
-    fallback_pos   = 0.0           # 上次记录的秒数
-    fallback_start = time.time()   # 上次记录时的墙钟
+    fallback_key   = None
+    fallback_pos   = 0.0
+    fallback_start = time.time()
+
+    hw_text      = ""
+    last_hw_time = 0.0
+
+    hw_cycle_start = time.time()
+    hw_was_shown   = False
+
+    if PSUTIL_OK:
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+
+    print("[*] 正在读取硬件信息……")
+    _CPU_NAME = _get_cpu_name()
+    _GPU_NAME = _get_gpu_name()
+    print(f"[*] CPU: {_CPU_NAME or '读取失败'}")
+    print(f"[*] GPU: {_GPU_NAME or '读取失败'}")
 
     print("[*] 已启动，正在监听播放器……")
     print(f"[*] OSC 目标：{VRC_IP}:{VRC_PORT}")
+    print(f"[*] 硬件信息每 {HW_GAP_SECONDS + HW_SHOW_SECONDS:.0f} 秒显示 "
+          f"{HW_SHOW_SECONDS:.0f} 秒")
     print("[*] 按 Ctrl+C 退出\n")
 
     while True:
@@ -344,23 +515,26 @@ async def main():
         except Exception:
             playing = False
 
-        # ── 先抓歌词（A/B 都要用到）──
+        # 换歌抓歌词
         key = f"{title}|{artist}"
         if key != lyric_key:
             lyric_key = key
-            lyrics = Lyrics()
+            track = Track()
             last_lyric = None
             loop = asyncio.get_running_loop()
-            lrc = await loop.run_in_executor(
+            res = await loop.run_in_executor(
                 None, fetch_lrc, title, artist, album, 0.0
             )
-            if lrc:
-                lyrics.load(lrc)
-                print(f"    已加载歌词 {len(lyrics.lines)} 行")
+            if res:
+                lrc, tly = res
+                track.lines = parse_lrc(lrc)
+                track.trans = parse_lrc(tly) if tly else []
+                print(f"    已加载歌词 {len(track.lines)} 行"
+                      f"（翻译 {len(track.trans)} 行）")
             else:
                 print("    没有找到同步歌词")
 
-        # ── 读取系统时间轴 ──
+        # 时间轴
         try:
             tl = session.get_timeline_properties()
             sys_pos = timeline_position(tl, playing)
@@ -368,16 +542,13 @@ async def main():
         except Exception:
             sys_pos, sys_len = 0.0, 0.0
 
-        # ── A: 系统不给时长就自己计时；B: 用歌词末行当总长 ──
         now_ts = time.time()
         if sys_len > 1:
-            # 系统给了完整数据，直接用
             pos, length = sys_pos, sys_len
             fallback_key   = key
             fallback_pos   = pos
             fallback_start = now_ts
         else:
-            # 系统没给时长 → 走内部计时
             if key != fallback_key:
                 fallback_key   = key
                 fallback_pos   = 0.0
@@ -385,15 +556,11 @@ async def main():
             if playing:
                 pos = fallback_pos + (now_ts - fallback_start)
             else:
-                # 暂停：冻结位置
                 fallback_pos   = fallback_pos + (now_ts - fallback_start)
                 fallback_start = now_ts
                 pos = fallback_pos
+            length = (track.lines[-1][0] + 8) if track.lines else 0.0
 
-            # B: 歌词最后一行时间 + 8 秒，当作总长度
-            length = (lyrics.lines[-1][0] + 8) if lyrics.lines else 0.0
-
-        # ── 播完一轮自动归零 ──
         if length > 0 and pos > length:
             fallback_pos   = 0.0
             fallback_start = now_ts
@@ -402,17 +569,40 @@ async def main():
         if not playing and not SHOW_WHEN_PAUSED:
             continue
 
-        # ── 歌词查询（带上偏移校正）──
-        cur_lyric = lyrics.at(pos + LYRIC_OFFSET) if lyrics.lines else ""
+        cur_lyric = track.at(pos + LYRIC_OFFSET) if track.lines else ""
+        cur_trans = ""
+        if SHOW_TRANSLATION and track.has_trans():
+            cur_trans = track.trans_at(pos + LYRIC_OFFSET)
 
-        # ── 拼装文本 ──
+        # 硬件数值刷新
+        if SHOW_HW and now_ts - last_hw_time >= HW_REFRESH:
+            last_hw_time = now_ts
+            hw_text = get_hw_text()
+
+        # 轮播：这一帧是否显示硬件行
+        show_hw_now = False
+        if SHOW_HW and hw_text:
+            if not HW_ROTATE:
+                show_hw_now = True
+            else:
+                cycle = HW_SHOW_SECONDS + HW_GAP_SECONDS
+                phase = (now_ts - hw_cycle_start) % cycle
+                show_hw_now = (phase < HW_SHOW_SECONDS)
+
+        if show_hw_now and not hw_was_shown:
+            print(f"    [硬件] {hw_text}")
+            hw_was_shown = True
+        elif not show_hw_now:
+            hw_was_shown = False
+
+        # 拼装
         head = ("♪ " if playing else "|| ") + title
         if artist:
             head += f" - {artist}"
 
         sep = "\n" if MULTILINE else "  |  "
 
-        def build(lyric_text):
+        def build(lyric_text, trans_text, hw=True):
             p = [head]
             if SHOW_PROGRESS:
                 if length > 0:
@@ -422,21 +612,32 @@ async def main():
                     p.append(fmt_time(pos))
             if SHOW_LYRIC and lyric_text:
                 p.append(lyric_text)
+            if SHOW_TRANSLATION and trans_text:
+                p.append(trans_text)
+            if SHOW_HW and hw and hw_text:
+                p.append(hw_text)
             return sep.join(p)
 
-        text = build(cur_lyric)
+        def assemble(include_hw):
+            t = build(cur_lyric, cur_trans, include_hw)
 
-        # 超长优先截断歌词行
-        if len(text) > CHATBOX_MAX_LEN and cur_lyric:
-            over = len(text) - CHATBOX_MAX_LEN
-            keep = len(cur_lyric) - over - 1
-            cur_lyric = (cur_lyric[:keep] + "…") if keep >= 4 else ""
-            text = build(cur_lyric)
-        if len(text) > CHATBOX_MAX_LEN:
-            text = text[:CHATBOX_MAX_LEN - 1] + "…"
-            cur_lyric = ""
+            if len(t) > CHATBOX_MAX_LEN and cur_trans:
+                fixed = build(cur_lyric, "", include_hw)
+                room = CHATBOX_MAX_LEN - len(fixed) - len(sep)
+                t = build(cur_lyric, truncate(cur_trans, max(0, room)), include_hw)
 
-        # ── 限流发送 ──
+            if len(t) > CHATBOX_MAX_LEN and cur_lyric:
+                fixed = build("", "", include_hw)
+                room = CHATBOX_MAX_LEN - len(fixed) - len(sep)
+                t = build(truncate(cur_lyric, max(0, room)), "", include_hw)
+
+            if len(t) > CHATBOX_MAX_LEN:
+                t = truncate(t, CHATBOX_MAX_LEN)
+            return t
+
+        text = assemble(include_hw=show_hw_now)
+
+        # 发送
         now = time.time()
         changed = (text != last_text)
         lyric_changed = SHOW_LYRIC and (cur_lyric != last_lyric)
@@ -453,7 +654,6 @@ async def main():
             except Exception as e:
                 print(f"    [OSC] 发送失败：{e}")
 
-        # ── Avatar 参数（可选）──
         if SEND_AVATAR_PARAMS:
             try:
                 ratio = (pos / length) if length > 0 else 0.0
