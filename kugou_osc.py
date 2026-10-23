@@ -52,6 +52,18 @@ SHOW_WHEN_PAUSED = True
 CHATBOX_MIN_INTERVAL = 1.5
 CHATBOX_MAX_LEN      = 142
 
+# ── 睡觉时间标记 ──
+SHOW_SLEEP_TAG  = True      # 是否在深夜时段于歌名上方加一行状态
+SLEEP_TAG_TEXT  = "💤 睡觉中"
+SLEEP_START_HOUR = 23       # 晚上 11 点开始
+SLEEP_END_HOUR   = 7        # 凌晨 7 点结束
+
+# ── 附加状态标记（跟在「睡觉中」后面同一行）──
+SHOW_EXTRA_TAG   = True
+EXTRA_TAG_TEXT   = "🔧 改模中"
+EXTRA_TAG_START_HOUR = None  # None = 全天显示；填 0~23 可只在某个时段显示
+EXTRA_TAG_END_HOUR   = None
+
 HW_REFRESH = 5.0            # 硬件占用数值刷新间隔(秒)
 
 # ── 硬件信息出现节奏 ──
@@ -386,6 +398,47 @@ def fmt_time(sec):
     return f"{sec // 60}:{sec % 60:02d}"
 
 
+def _in_hour_range(h, start, end):
+    """h 是否落在 start~end 之间（支持跨零点）。"""
+    if start == end:
+        return True
+    if start < end:
+        return start <= h < end
+    return h >= start or h < end
+
+
+def is_sleep_time(now=None):
+    """当前本地时间是否处于 SLEEP_START_HOUR ~ SLEEP_END_HOUR 之间（跨零点）。"""
+    if not SHOW_SLEEP_TAG:
+        return False
+    h = (now or datetime.now()).hour
+    return _in_hour_range(h, SLEEP_START_HOUR, SLEEP_END_HOUR)
+
+
+def extra_tag_text(now=None):
+    """附加状态标签文本；不在时段内返回空串。"""
+    if not SHOW_EXTRA_TAG or not EXTRA_TAG_TEXT:
+        return ""
+    if EXTRA_TAG_START_HOUR is None or EXTRA_TAG_END_HOUR is None:
+        return EXTRA_TAG_TEXT
+    h = (now or datetime.now()).hour
+    if _in_hour_range(h, EXTRA_TAG_START_HOUR, EXTRA_TAG_END_HOUR):
+        return EXTRA_TAG_TEXT
+    return ""
+
+
+def status_tag_line(now=None):
+    """拼出「💤 睡觉中 🔧 改模中」这一行；无内容时返回空串。"""
+    now = now or datetime.now()
+    tags = []
+    if is_sleep_time(now):
+        tags.append(SLEEP_TAG_TEXT)
+    extra = extra_tag_text(now)
+    if extra:
+        tags.append(extra)
+    return "  ".join(tags)
+
+
 def make_bar(pos, length, width=BAR_WIDTH):
     if length <= 0:
         return ""
@@ -603,7 +656,11 @@ async def main():
         sep = "\n" if MULTILINE else "  |  "
 
         def build(lyric_text, trans_text, hw=True):
-            p = [head]
+            p = []
+            tag_line = status_tag_line()
+            if tag_line:
+                p.append(tag_line)
+            p.append(head)
             if SHOW_PROGRESS:
                 if length > 0:
                     p.append(f"[{make_bar(pos, length)}] "
